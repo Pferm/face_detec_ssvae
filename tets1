@@ -1,0 +1,216 @@
+# Import Tensorflow 2.0
+import tensorflow as tf
+
+import IPython
+import functools
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+
+!pip install mitdeeplearning
+import mitdeeplearning as mdl
+
+path_to_training_data = tf.keras.utils.get_file('train_face.h5', 'https://www.dropbox.com/s/hlz8atheyozp1yx/train_face.h5?dl=1')
+loader = mdl.lab2.TrainingDatasetLoader(path_to_training_data)
+
+### Definiendo el CNN ###
+
+n_filters = 12 
+
+'''funcion que define CNN estandar''
+def make_standard_classifier(n_outputs=1):
+  Conv2D = functools.partial(tf.keras.layers.Conv2D, padding='same', activation='relu')
+  BatchNormalization = tf.keras.layers.BatchNormalization
+  Flatten = tf.keras.layers.Flatten
+  Dense = functools.partial(tf.keras.layers.Dense, activation='relu')
+
+  model = tf.keras.Sequential([ 
+    Conv2D(filters=1*n_filters, kernel_size=5,  strides=2),
+    BatchNormalization(),
+    
+    Conv2D(filters=2*n_filters, kernel_size=5,  strides=2),
+    BatchNormalization(),
+
+    Conv2D(filters=4*n_filters, kernel_size=3,  strides=2),
+    BatchNormalization(),
+
+    Conv2D(filters=6*n_filters, kernel_size=3,  strides=2),
+    BatchNormalization(),
+
+    Flatten(),
+    Dense(512),
+    Dense(n_outputs, activation=None),
+  ])
+  return model
+
+standard_classifier = make_standard_classifier()
+
+### Entrenando estandar CNN ###
+
+# Def hiperparametros
+batch_size = 32
+num_epochs = 2  
+learning_rate = 5e-4
+
+optimizer = tf.keras.optimizers.Adam(learning_rate) # define our optimizer
+loss_history = mdl.util.LossHistory(smoothing_factor=0.99) # to record loss evolution
+plotter = mdl.util.PeriodicPlotter(sec=2, scale='semilogy')
+if hasattr(tqdm, '_instances'): tqdm._instances.clear() # clear if it exists
+
+@tf.function
+def standard_train_step(x, y):
+  with tf.GradientTape() as tape:
+    # feed the images into the model
+    logits = standard_classifier(x) 
+    # Compute the loss
+    loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=y, logits=logits)
+
+  # Backprop
+  grads = tape.gradient(loss, standard_classifier.trainable_variables)
+  optimizer.apply_gradients(zip(grads, standard_classifier.trainable_variables))
+  return loss
+
+# Ieracion de entrenamiento 
+for epoch in range(num_epochs):
+  for idx in tqdm(range(loader.get_train_size()//batch_size)):
+    # Grab a batch of training data and propagate through the network
+    x, y = loader.get_batch(batch_size)
+    loss = standard_train_step(x, y)
+
+    # Record the loss and plot the evolution of the loss as a function of training
+    loss_history.append(loss.numpy().mean())
+    plotter.plot(loss_history.get())
+
+### Evaluando estandar CNN###
+
+# TRAINING DATA
+# Evaluando en los sets CelebA+Imagenet
+(batch_x, batch_y) = loader.get_batch(5000)
+y_pred_standard = tf.round(tf.nn.sigmoid(standard_classifier.predict(batch_x)))
+acc_standard = tf.reduce_mean(tf.cast(tf.equal(batch_y, y_pred_standard), tf.float32))
+
+print("Standard CNN accuracy on (potentially biased) training set: {:.4f}".format(acc_standard.numpy()))
+
+### Definiendo la funcion de perdida VAE ###
+
+def vae_loss_function(x, x_recon, mu, logsigma, kl_weight=0.0005):
+  latent_loss = 0.5 * tf.reduce_sum(tf.exp(logsigma) + tf.square(mu) - 1.0 - logsigma, axis=1)
+  reconstruction_loss = tf.reduce_mean(tf.abs(x-x_recon), axis=(1,2,3))
+  vae_loss = kl_weight * latent_loss + reconstruction_loss
+  return vae_loss
+
+  ### VAE muestreo ###
+  
+def sampling(z_mean, z_logsigma):
+  batch, latent_dim = z_mean.shape
+  epsilon = tf.random.normal(shape=(batch, latent_dim))
+  z = z_mean + tf.math.exp(0.5 * z_logsigma) * epsilon
+  return z
+
+### funcion de perdida para SS-VAE ###
+
+def ss_vae_loss_function(x, x_pred, y, y_logit, mu, logsigma):
+  vae_loss = vae_loss_function(x, x_pred, mu, logsigma)
+  classification_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=y, logits=y_logit)
+  face_indicator = tf.cast(tf.equal(y, 1), tf.float32)
+  total_loss = tf.reduce_mean(
+      classification_loss + 
+      face_indicator * vae_loss
+  return total_loss, classification_loss, vae_loss
+
+
+### Decodificador del SS-VAE ###
+
+def make_face_decoder_network(n_filters=12):
+
+  # Definiendo las capas a utilizar
+  Conv2DTranspose = functools.partial(tf.keras.layers.Conv2DTranspose, padding='same', activation='relu')
+  BatchNormalization = tf.keras.layers.BatchNormalization
+  Flatten = tf.keras.layers.Flatten
+  Dense = functools.partial(tf.keras.layers.Dense, activation='relu')
+  Reshape = tf.keras.layers.Reshape
+
+  # Creando el decodificador usando Sequential
+  decoder = tf.keras.Sequential([
+    # Transformando a pre-convolutional
+    Dense(units=4*4*6*n_filters), 
+    Reshape(target_shape=(4, 4, 6*n_filters)),
+
+    # Re escalando
+    Conv2DTranspose(filters=4*n_filters, kernel_size=3,  strides=2),
+    Conv2DTranspose(filters=2*n_filters, kernel_size=3,  strides=2),
+    Conv2DTranspose(filters=1*n_filters, kernel_size=5,  strides=2),
+    Conv2DTranspose(filters=3, kernel_size=5,  strides=2),
+  ])
+
+  return decoder
+
+  ### Definiendo y creando la clase SS-VAE y sus metodos ###
+
+class SS_VAE(tf.keras.Model):
+  def __init__(self, latent_dim):
+    super(SS_VAE, self).__init__()
+    self.latent_dim = latent_dim
+    num_encoder_dims = 2*self.latent_dim + 1
+    self.encoder = make_standard_classifier(num_encoder_dims)
+    self.decoder = make_face_decoder_network()
+
+  def encode(self, x): #
+    encoder_output = self.encoder(x)
+    y_logit = tf.expand_dims(encoder_output[:, 0], -1)
+    z_mean = encoder_output[:, 1:self.latent_dim+1] 
+    z_logsigma = encoder_output[:, self.latent_dim+1:]
+    return y_logit, z_mean, z_logsigma
+
+  def decode(self, z):
+    reconstruction = self.decoder(z)
+    return reconstruction
+
+  def call(self, x): 
+    y_logit, z_mean, z_logsigma = self.encode(x)
+    z = sampling(z_mean, z_logsigma)
+    recon = self.decode(z)
+    return y_logit, z_mean, z_logsigma, recon
+
+  def predict(self, x):
+    y_logit, z_mean, z_logsigma = self.encode(x)
+    return y_logit
+
+    
+ss_vae = SS_VAE(latent_dim=32)
+
+### Entrenando SS-VAE ###
+
+# Def Hiperparametros
+batch_size = 32
+learning_rate = 5e-4
+latent_dim = 32
+num_epochs = 6
+
+ss_vae = SS_VAE(latent_dim)
+optimizer = tf.keras.optimizers.Adam(learning_rate)
+
+@tf.function
+def ss_vae_train_step(x, y):
+  with tf.GradientTape() as tape:
+    y_logit, z_mean, z_logsigma, x_recon = ss_vae(x)
+    loss, class_loss, _ = ss_vae_loss_function(x, x_recon, y, y_logit, z_mean, z_logsigma)
+  grads = tape.gradient(loss, ss_vae.trainable_variables)
+  optimizer.apply_gradients(zip(grads, ss_vae.trainable_variables))
+  return loss
+  
+all_faces = loader.get_all_train_faces()
+
+if hasattr(tqdm, '_instances'): tqdm._instances.clear()
+
+# Iteracion de entrenamiento 
+for i in range(num_epochs):
+  IPython.display.clear_output(wait=True)
+  print("Starting epoch {}/{}".format(i+1, num_epochs))
+  for j in tqdm(range(loader.get_train_size() // batch_size)):
+    (x, y) = loader.get_batch(batch_size)
+    loss = ss_vae_train_step(x, y)
+    if j % 500 == 0:
+      mdl.util.plot_sample(x, y, ss_vae)
+      
+
